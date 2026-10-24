@@ -12,8 +12,10 @@
 #include <float.h>
 #include <inttypes.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -243,27 +245,6 @@ int parse_csv_number(const char *text, size_t column, number *parsed,
         }
         if (!digits) {
             return -1;
-        }
-        if (text[index] == 'e' || text[index] == 'E') {
-            ++index;
-            int exponent_negative = text[index] == '-';
-            if (text[index] == '-' || text[index] == '+') {
-                ++index;
-            }
-            size_t first_digit = index;
-            unsigned exponent = 0;
-            while (text[index] >= '0' && text[index] <= '9') {
-                exponent = exponent * 10 + (unsigned)(text[index++] - '0');
-                if (exponent > 324) {
-                    return -1;
-                }
-            }
-            if (index == first_digit) {
-                return -1;
-            }
-            for (unsigned digit = 0; digit < exponent; ++digit) {
-                real *= exponent_negative ? 0.1 : 10.0;
-            }
         }
         if (text[index] || !(real <= DBL_MAX)) {
             return -1;
@@ -646,269 +627,36 @@ number aggregate_group(const group_input *input, const group_indices *groups,
     return (number){.real = accumulated};
 }
 
-/* Polars rs-0.51.0: group_by/aggregations::{agg_var,agg_std,agg_quantile},
- * polars-queries/series/queries/rank.rs (Average), polars-expr/dispatch/misc.rs
- * (spearman_rank_corr), and polars-compute/moment.rs (PearsonState).
- * Group indices gather original columns; NULL pairs are removed before ranking.
- * The C sort/selection backends replace Rust argsort/select_nth_unstable.
- * Input is finite; integer ranking retains the exact Int32 ordering.
- * Variance/stddev use ddof=0 in both benchmark applications. */
-int prepare_statistics(statistic_workspace *workspace, size_t count)
-{
-    if (count <= workspace->capacity) {
-        return error_none;
-    }
-    if (count > SIZE_MAX / sizeof(statistic_row)) {
-        return error_memory;
-    }
-    statistic_row *rows = malloc(count * sizeof(*rows));
-    rank_item *items = malloc(count * sizeof(*items));
-    rank_item *scratch = malloc(count * sizeof(*scratch));
-    if (!rows || !items || !scratch) {
-        free(rows);
-        free(items);
-        free(scratch);
-        return error_memory;
-    }
-    free(workspace->rows);
-    free(workspace->items);
-    free(workspace->scratch);
-    *workspace = (statistic_workspace){rows, items, scratch, count};
-    return error_none;
-}
-
-int number_less(number left, number right, column_id column)
-{
-    return column == column_v3 ? left.real < right.real :
-                                 left.integer < right.integer;
-}
-
-double number_as_double(number cell, column_id column)
-{
-    return column == column_v3 ? cell.real : (double)cell.integer;
-}
-
-void rank_group(statistic_workspace *workspace, size_t count, column_id column,
-                int right_column)
-{
-    for (size_t row = 0; row < count; ++row) {
-        workspace->items[row] = (rank_item){right_column ?
-                                                workspace->rows[row].right :
-                                                workspace->rows[row].left,
-                                            row};
-    }
-    rank_item *src = workspace->items, *dst = workspace->scratch;
-    for (size_t width = 1; width < count; width *= 2) {
-        for (size_t begin = 0; begin < count; begin += 2 * width) {
-            size_t middle = begin + width < count ? begin + width : count;
-            size_t end = middle + width < count ? middle + width : count;
-            size_t left = begin, right = middle;
-            for (size_t out = begin; out < end; ++out) {
-                if (left < middle &&
-                    (right == end ||
-                     !number_less(src[right].cell, src[left].cell, column))) {
-                    dst[out] = src[left++];
-                } else {
-                    dst[out] = src[right++];
-                }
-            }
-        }
-        rank_item *swap = src;
-        src = dst;
-        dst = swap;
-    }
-    for (size_t begin = 0; begin < count;) {
-        size_t end = begin + 1;
-        while (end < count &&
-               !number_less(src[begin].cell, src[end].cell, column)) {
-            ++end;
-        }
-        double rank = ((double)begin + (double)end + 1.0) * 0.5;
-        for (size_t index = begin; index < end; ++index) {
-            statistic_row *row = &workspace->rows[src[index].row];
-            if (right_column) {
-                row->right_rank = rank;
-            } else {
-                row->left_rank = rank;
-            }
-        }
-        begin = end;
-    }
-}
-
-number select_number(rank_item *items, size_t count, size_t nth,
-                     column_id column)
-{
-    size_t begin = 0, end = count;
-    while (end - begin > 1) {
-        number left = items[begin].cell,
-               middle = items[begin + (end - begin) / 2].cell;
-        number right = items[end - 1].cell;
-        if (number_less(middle, left, column)) {
-            number swap = left;
-            left = middle;
-            middle = swap;
-        }
-        if (number_less(right, middle, column)) {
-            middle = number_less(right, left, column) ? left : right;
-        }
-        size_t lower = begin, cursor = begin, upper = end;
-        while (cursor < upper) {
-            if (number_less(items[cursor].cell, middle, column)) {
-                rank_item swap = items[lower];
-                items[lower++] = items[cursor];
-                items[cursor++] = swap;
-            } else if (number_less(middle, items[cursor].cell, column)) {
-                rank_item swap = items[--upper];
-                items[upper] = items[cursor];
-                items[cursor] = swap;
-            } else {
-                ++cursor;
-            }
-        }
-        if (nth < lower) {
-            end = lower;
-        } else if (nth >= upper) {
-            begin = upper;
-        } else {
-            return middle;
-        }
-    }
-    return items[begin].cell;
-}
-
-number aggregate_statistic(const group_input *input,
-                           const group_indices *groups, size_t group,
-                           size_t agg_index, statistic_workspace *workspace,
-                           int *valid)
-{
-    const aggregate_spec *agg = &input->query->aggregates[agg_index];
-    const group_span *span = &groups->spans[group];
-    int paired = agg->type == aggregate_pearson ||
-                 agg->type == aggregate_spearman;
-    size_t count = 0;
-    for (size_t offset = 0; offset < span->count; ++offset) {
-        size_t row_id = groups->row_ids[span->begin + offset];
-        const resident_frame *shard = original_shard(input, row_id);
-        size_t row = original_row_offset(row_id);
-        if (!(shard->valid[row] & (1u << agg->column)) ||
-            (paired && !(shard->valid[row] & (1u << agg->second_column)))) {
-            continue;
-        }
-        statistic_row *entry = &workspace->rows[count++];
-        entry->left = original_measure(shard, row, agg->column);
-        if (paired) {
-            entry->right = original_measure(shard, row, agg->second_column);
-        }
-    }
-
-    *valid = 1;
-    if (agg->type == aggregate_quantile) {
-        if (!count) {
-            *valid = 0;
-            return (number){0};
-        }
-        for (size_t row = 0; row < count; ++row) {
-            workspace->items[row] = (rank_item){workspace->rows[row].left, row};
-        }
-        double position = (double)(count - 1) * agg->quantile;
-        size_t lower = (size_t)position;
-        size_t upper = lower + (lower + 1 < count);
-        double low = number_as_double(select_number(workspace->items, count,
-                                                    lower, agg->column),
-                                      agg->column);
-        double high = number_as_double(select_number(workspace->items, count,
-                                                     upper, agg->column),
-                                       agg->column);
-        return (number){.real =
-                            low + (position - (double)lower) * (high - low)};
-    }
-    if (count < 2) {
-        *valid = paired || count == 1;
-        return (number){.real = paired ? NAN : 0.0};
-    }
-    int ranked = agg->type == aggregate_spearman;
-    if (ranked) {
-        rank_group(workspace, count, agg->column, 0);
-        rank_group(workspace, count, agg->second_column, 1);
-    }
-    double mean_left = 0.0, mean_right = 0.0;
-    for (size_t row = 0; row < count; ++row) {
-        statistic_row *entry = &workspace->rows[row];
-        if (!ranked) {
-            entry->left_rank = number_as_double(entry->left, agg->column);
-            entry->right_rank =
-                paired ? number_as_double(entry->right, agg->second_column) :
-                         0.0;
-        }
-        mean_left += entry->left_rank;
-        if (paired) {
-            mean_right += entry->right_rank;
-        }
-    }
-    mean_left /= (double)count;
-    mean_right /= (double)count;
-    double square_left = 0.0, square_right = 0.0, cross_sum = 0.0;
-    for (size_t row = 0; row < count; ++row) {
-        double left = workspace->rows[row].left_rank - mean_left;
-        square_left += left * left;
-        if (paired) {
-            double right = workspace->rows[row].right_rank - mean_right;
-            square_right += right * right;
-            cross_sum += left * right;
-        }
-    }
-    if (paired) {
-        double denominator = square_left * square_right;
-        return (number){
-            .real = denominator > 0.0 ? cross_sum / sqrt(denominator) : NAN};
-    }
-    double variance = square_left / (double)count;
-    return (number){.real = agg->type == aggregate_stddev ? sqrt(variance) :
-                                                            variance};
-}
-
-/* Only the producer calls this allocator and writes the returned packet.
- * Small first blocks avoid allocating a large block for every one of P*N
- * possible channels. Subsequent blocks grow to a bounded DSM fetch size.
- * Old blocks are reused with the current query's stride, after the read-done
- * barrier. `last` bounds the live prefix; unused old tail blocks stay idle. */
+/* Only the producer calls this appender and writes the returned packet.
+ * One flat buffer per partition doubles on demand; its capacity survives
+ * across queries while the row count resets after the read-done barrier. */
 uint64_t *append_exchange(exchange_partition *partition, size_t stride)
 {
-    exchange_block *block = partition->last;
-    if (!block) {
-        block = partition->first;
-        if (!block) {
-            block =
-                malloc(sizeof(*block) + initial_block_words * sizeof(uint64_t));
-            if (!block) {
-                return NULL;
-            }
-            *block = (exchange_block){.word_capacity = initial_block_words};
-            partition->first = block;
-        }
-        block->count = 0;
-        partition->last = block;
+    if (partition->rows == SIZE_MAX / stride) {
+        return NULL;
     }
-    if (block->count == block->word_capacity / stride) {
-        exchange_block *next = block->next;
-        if (!next) {
-            size_t capacity = block->word_capacity * 2;
-            if (capacity > max_exchange_words) {
-                capacity = max_exchange_words;
-            }
-            next = malloc(sizeof(*next) + capacity * sizeof(uint64_t));
-            if (!next) {
-                return NULL;
-            }
-            *next = (exchange_block){.word_capacity = capacity};
-            block->next = next;
+    size_t needed = (partition->rows + 1) * stride;
+    if (needed > partition->word_capacity) {
+        size_t capacity = partition->word_capacity * 2;
+        if (capacity < needed) {
+            capacity = needed;
         }
-        next->count = 0;
-        partition->last = block = next;
+        if (capacity > SIZE_MAX / sizeof(uint64_t)) {
+            return NULL;
+        }
+        uint64_t *words = malloc(capacity * sizeof(*words));
+        if (!words) {
+            return NULL;
+        }
+        if (partition->rows) {
+            memcpy(words, partition->words, partition->rows * stride *
+                          sizeof(*words));
+        }
+        free(partition->words);
+        partition->words = words;
+        partition->word_capacity = capacity;
     }
-    uint64_t *packet = block->words + block->count * stride;
-    ++block->count;
+    uint64_t *packet = partition->words + partition->rows * stride;
     ++partition->rows;
     return packet;
 }
@@ -982,6 +730,58 @@ result_frame *append_result(query_result *result, const query_spec *query,
     return frame;
 }
 
+/* Appends one formatted field and returns the new end offset, stopping at
+ * the line capacity. */
+static size_t append_field(char *dst, size_t capacity, size_t used,
+                           const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(dst + used, capacity - used, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= capacity - used) {
+        return capacity - 1;
+    }
+    return used + (size_t)written;
+}
+
+/* The worker formats its own preview lines; main prints finished text and
+ * never decodes keys or aggregates. Output matches the printed row format. */
+void format_result_row(char *dst, size_t capacity, const result_frame *frame,
+                       const query_spec *query, size_t group)
+{
+    size_t used = 0;
+    for (size_t key = 0; key < query->key_count; ++key) {
+        if (key) {
+            dst[used++] = ',';
+        }
+        if (frame->valid[group] & (1u << key)) {
+            used = append_field(dst, capacity, used, "%" PRIu32,
+                                frame->keys[key * frame->groups + group]);
+        } else {
+            used = append_field(dst, capacity, used, "NULL");
+        }
+    }
+    for (size_t index = 0; index < query->aggregate_count; ++index) {
+        dst[used++] = ',';
+        if (!(frame->valid[group] & (1u << (8 + index)))) {
+            used = append_field(dst, capacity, used, "NULL");
+            continue;
+        }
+        const aggregate_spec *agg = &query->aggregates[index];
+        number cell = frame->aggregates[index * frame->groups + group];
+        if (agg->type == aggregate_count || agg->type == aggregate_count_all) {
+            used = append_field(dst, capacity, used, "%" PRIu64, cell.bits);
+        } else {
+            used = append_field(dst, capacity, used, "%.17g", cell.real);
+        }
+    }
+    if (used + 1 < capacity) {
+        dst[used++] = '\n';
+    }
+    dst[used] = '\0';
+}
+
 /* DRust GroupBy::keys / take: use representative ORIGINAL row IDs to
  * materialize every output key column, independently of aggregate columns. */
 void materialize_keys(const group_input *input, const group_indices *groups,
@@ -1004,8 +804,7 @@ void materialize_keys(const group_input *input, const group_indices *groups,
 }
 
 int materialize_groups(const group_input *input, const group_indices *groups,
-                       query_result *result, query_preview *preview,
-                       statistic_workspace *workspace)
+                       query_result *result, query_preview *preview)
 {
     result_frame *frame =
         append_result(result, input->query, groups->group_count);
@@ -1015,40 +814,19 @@ int materialize_groups(const group_input *input, const group_indices *groups,
     materialize_keys(input, groups, frame);
     for (size_t index = 0; index < input->query->aggregate_count; ++index) {
         const aggregate_spec *agg = &input->query->aggregates[index];
-        if (agg->type >= aggregate_variance) {
-            size_t count = 0;
-            for (size_t group = 0; group < groups->group_count; ++group) {
-                if (count < groups->spans[group].count) {
-                    count = groups->spans[group].count;
-                }
-            }
-            if (prepare_statistics(workspace, count)) {
-                return error_memory;
-            }
-        }
         /* No fusion: every operator constructs a complete result column. */
         for (size_t group = 0; group < groups->group_count; ++group) {
             int valid;
-            number cell =
-                agg->type >= aggregate_variance ?
-                    aggregate_statistic(input, groups, group, index, workspace,
-                                        &valid) :
-                    aggregate_group(input, groups, group, agg, &valid);
+            number cell = aggregate_group(input, groups, group, agg, &valid);
             frame->valid[group] |= (uint16_t)valid << (8 + index);
             frame->aggregates[index * frame->groups + group] = cell;
         }
     }
     for (size_t group = 0;
          group < frame->groups && preview->rows < preview_rows; ++group) {
-        uint64_t *row = preview->words[preview->rows++];
-        row[0] = frame->valid[group];
-        for (size_t key = 0; key < input->query->key_count; ++key) {
-            row[1 + key] = frame->keys[key * frame->groups + group];
-        }
-        for (size_t agg = 0; agg < input->query->aggregate_count; ++agg) {
-            row[1 + input->query->key_count + agg] =
-                frame->aggregates[agg * frame->groups + group].bits;
-        }
+        format_result_row(preview->lines[preview->rows], preview_line_bytes,
+                          frame, input->query, group);
+        ++preview->rows;
     }
     preview->groups = result->groups;
     return error_none;
@@ -1077,22 +855,12 @@ int gather_partition(size_t partition, group_input *input,
     size_t row = 0;
     for (const worker_input *worker = worker_inputs; worker;
          worker = worker->next) {
-        const exchange_partition *part =
-            &worker->mailbox->partitions[partition];
-        if (!part->rows) {
-            continue;
-        }
-        for (const exchange_block *block = part->first; block;
-             block = block->next) {
-            for (size_t index = 0; index < block->count; ++index) {
-                const uint64_t *packet = block->words + index * stride;
-                error = index_group_row(input, groups, row++, packet);
-                if (error) {
-                    return error;
-                }
-            }
-            if (block == part->last) {
-                break;
+        const exchange_partition *part = &worker->mailbox->partitions[partition];
+        for (size_t index = 0; index < part->rows; ++index) {
+            error = index_group_row(input, groups, row++,
+                                    part->words + index * stride);
+            if (error) {
+                return error;
             }
         }
     }
@@ -1102,7 +870,7 @@ int gather_partition(size_t partition, group_input *input,
 
 int consume_partitions(const worker_input *worker, group_input *input,
                        group_indices *groups, query_result *result,
-                       query_preview *preview, statistic_workspace *workspace)
+                       query_preview *preview)
 {
     for (const worker_input *peer_input = worker_inputs; peer_input;
          peer_input = peer_input->next) {
@@ -1117,7 +885,7 @@ int consume_partitions(const worker_input *worker, group_input *input,
         int error = gather_partition(partition, input, groups);
         if (!error) {
             error =
-                materialize_groups(input, groups, result, preview, workspace);
+                materialize_groups(input, groups, result, preview);
         }
         if (error) {
             return error;
@@ -1148,12 +916,7 @@ void free_exchange(worker_mailbox *mailbox, size_t partitions)
         return;
     }
     for (size_t partition = 0; partition < partitions; ++partition) {
-        exchange_block *block = mailbox->partitions[partition].first;
-        while (block) {
-            exchange_block *next = block->next;
-            free(block);
-            block = next;
-        }
+        free(mailbox->partitions[partition].words);
     }
     free(mailbox);
 }
@@ -1209,7 +972,6 @@ void *worker_entry(void *argument)
     if (!received.shards) {
         error = error_memory;
     }
-    statistic_workspace statistics = {0};
     if (!error) {
         error = load_input_shard(input, &input->frame);
     }
@@ -1233,7 +995,6 @@ void *worker_entry(void *argument)
         if (mailbox) {
             for (size_t partition = 0; partition < input->partition_count;
                  ++partition) {
-                mailbox->partitions[partition].last = NULL;
                 mailbox->partitions[partition].rows = 0;
             }
             if (!error) {
@@ -1249,8 +1010,7 @@ void *worker_entry(void *argument)
         if (!error) {
             error = consume_partitions(input, &received, &groups,
                                        &results[query_index],
-                                       &report->queries[query_index],
-                                       &statistics);
+                                       &report->queries[query_index]);
         }
 
         pthread_barrier_wait(
@@ -1260,9 +1020,6 @@ void *worker_entry(void *argument)
      * query interval. The final B2 has ended every shared-input/packet read. */
     free_group_indices(&groups);
     free(received.shards);
-    free(statistics.rows);
-    free(statistics.items);
-    free(statistics.scratch);
     free_exchange(mailbox, input->partition_count);
     double query_end_ms = elapsed_ms(0.0);
 
@@ -1278,35 +1035,6 @@ void *worker_entry(void *argument)
         report->query_end_ms = query_end_ms;
     }
     return report;
-}
-
-void print_result_row(const uint64_t *row, const query_spec *query)
-{
-    for (size_t key = 0; key < query->key_count; ++key) {
-        if (key) {
-            printf(",");
-        }
-        if (row[0] & (UINT64_C(1) << key)) {
-            printf("%" PRIu64, row[1 + key]);
-        } else {
-            printf("NULL");
-        }
-    }
-    for (size_t index = 0; index < query->aggregate_count; ++index) {
-        printf(",");
-        if (!(row[0] & (UINT64_C(1) << (8 + index)))) {
-            printf("NULL");
-            continue;
-        }
-        const aggregate_spec *agg = &query->aggregates[index];
-        number cell = {.bits = row[1 + query->key_count + index]};
-        if (agg->type == aggregate_count || agg->type == aggregate_count_all) {
-            printf("%" PRIu64, cell.bits);
-        } else {
-            printf("%.17g", cell.real);
-        }
-    }
-    printf("\n");
 }
 
 /* O(workers + preview_rows) per query; there is no main-thread full-result
@@ -1330,18 +1058,6 @@ void print_query_results(const query_spec *queries, const size_t *schedule,
             const aggregate_spec *spec = &query->aggregates[agg];
             if (spec->type == aggregate_count_all) {
                 printf(",count(*)");
-            } else if (spec->type == aggregate_pearson ||
-                       spec->type == aggregate_spearman) {
-                printf(",%s(%s;%s)", aggregate_names[spec->type],
-                       column_names[spec->column],
-                       column_names[spec->second_column]);
-            } else if (spec->type == aggregate_quantile) {
-                printf(",quantile(%s;%.2f)", column_names[spec->column],
-                       spec->quantile);
-            } else if (spec->type == aggregate_variance ||
-                       spec->type == aggregate_stddev) {
-                printf(",%s(%s;ddof=0)", aggregate_names[spec->type],
-                       column_names[spec->column]);
             } else {
                 printf(",%s(%s)", aggregate_names[spec->type],
                        column_names[spec->column]);
@@ -1354,7 +1070,7 @@ void print_query_results(const query_spec *queries, const size_t *schedule,
             const query_preview *preview = &report->queries[index];
             for (size_t row = 0; row < preview->rows && printed < preview_rows;
                  ++row) {
-                print_result_row(preview->words[row], query);
+                fputs(preview->lines[row], stdout);
                 ++printed;
             }
         }
@@ -1383,10 +1099,10 @@ void print_usage(void)
 {
     printf(
         "Usage: dataframe [--threads N] [--partitions P] [--passes R]\n"
-        "                 [--suite drust|extended|statistics] [--query Q] input.csv\n"
+        "                 [--suite drust|extended] [--query Q] input.csv\n"
         "H2O columns: id1,id2,id3,id4,id5,id6,v1,v2,v3; header required.\n"
         "Defaults: 8 workers, P=N, 1 pass, DRust's 29 query occurrences.\n"
-        "Extended: Q1..Q13 once; statistics: Q14..Q19 once. --query Q: 1..19.\n");
+        "Extended: Q1..Q13 once. --query Q: 1..13.\n");
 }
 
 /* Return 0 for valid arguments, 1 for help, and -1 for invalid input. */
@@ -1423,8 +1139,6 @@ int parse_arguments(int argc, char **argv, benchmark_config *config)
                     config->suite = suite_drust;
                 } else if (text_equal(parameter.bytes, "extended")) {
                     config->suite = suite_extended;
-                } else if (text_equal(parameter.bytes, "statistics")) {
-                    config->suite = suite_statistics;
                 } else {
                     error = -1;
                 }
@@ -1455,11 +1169,6 @@ int prepare_query_schedule(const benchmark_config *config,
 {
     if (config->selected_query) {
         schedule->indices[schedule->count++] = config->selected_query - 1;
-    } else if (config->suite == suite_statistics) {
-        for (size_t query = extended_query_count; query < query_spec_count;
-             ++query) {
-            schedule->indices[schedule->count++] = query;
-        }
     } else if (config->suite == suite_extended) {
         for (size_t query = 0; query < extended_query_count; ++query) {
             schedule->indices[schedule->count++] = query;

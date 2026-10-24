@@ -40,8 +40,8 @@ id002,id001,id002,2,2,1,-5,10,3.5
 ```
 
 The six keys are unsigned 32-bit integers, optionally prefixed with `id`.
-`v1` and `v2` are signed 32-bit integers; `v3` is a finite double and may
-use decimal or scientific notation. Empty fields, `NA`, `NULL`, `na`, and
+`v1` and `v2` are signed 32-bit integers; `v3` is a finite double in decimal
+notation. Empty fields, `NA`, `NULL`, `na`, and
 `null` mean missing data. Missing keys form groups like other keys;
 aggregates skip missing inputs, while `count(*)` counts every row.
 
@@ -58,8 +58,7 @@ supported. No dataset is bundled or downloaded.
 | `--passes R` | Repeat the selected schedule R times; defaults to 1. |
 | `--suite drust` | Default: Q10 twice, then Q1–Q9 three times, for 29 queries. |
 | `--suite extended` | Run Q1–Q13 once. |
-| `--suite statistics` | Run Q14–Q19 once. |
-| `--query Q` | Run one query, 1–19, per pass; overrides the suite. |
+| `--query Q` | Run one query, 1–13, per pass; overrides the suite. |
 
 All workers cooperate on each query; queries run sequentially. The query
 definitions live in `dataframe.h`:
@@ -79,16 +78,8 @@ definitions live in `dataframe.h`:
 | Q11 | id1 | mean(v1), mean(v3), count(v3), max(v2) |
 | Q12 | id4, id5 | sum(v1), min(v2), max(v3), count(*) |
 | Q13 | id3 | mean(v3), count(v3) |
-| Q14 | id1, id2 | Spearman(v1, v3) |
-| Q15 | id4, id5 | Spearman(v2, v3) |
-| Q16 | id2, id4 | Spearman(v1, v2) |
-| Q17 | id1, id2 | quantile(v3, 0.50), quantile(v3, 0.90), quantile(v3, 0.99) |
-| Q18 | id4, id5 | variance(v1), stddev(v3) |
-| Q19 | id2, id4 | Pearson(v1, v3), Pearson(v2, v3) |
 
-Reductions return doubles except counts. Variance and standard deviation
-use `ddof=0`; quantiles use linear interpolation; Spearman correlations
-use average ranks for ties and remove missing pairs before ranking.
+Reductions return doubles except counts.
 
 The final line reports processed rows, elapsed milliseconds, and throughput.
 `query_ms` spans the worker query loop and workspace/exchange cleanup.

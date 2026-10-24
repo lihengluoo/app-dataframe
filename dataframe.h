@@ -9,19 +9,18 @@
 enum {
     key_columns = 6,
     input_columns = 9,
-    max_aggregates = 6,
+    max_aggregates = 4,
     max_worker_threads = 4096,
     preview_rows = 5,
-    max_result_row_words = 1 + key_columns + max_aggregates,
+    preview_line_bytes = 256,
     csv_buffer_bytes = 65536,
-    initial_block_words = 256,
-    max_exchange_words = 8192,
+    initial_partition_words = 256,
     row_shard_shift = 48,
     default_thread_count = 8,
     default_pass_count = 1,
     drust_query_count = 10,
     extended_query_count = 13,
-    query_spec_count = 19,
+    query_spec_count = 13,
     drust_query_repeats = 3,
     drust_schedule_count = 2 + (drust_query_count - 1) * drust_query_repeats
 };
@@ -45,11 +44,6 @@ typedef enum {
     aggregate_count,
     aggregate_count_all,
     aggregate_mean,
-    aggregate_variance,
-    aggregate_stddev,
-    aggregate_pearson,
-    aggregate_spearman,
-    aggregate_quantile,
     aggregate_type_count
 } aggregate_type;
 
@@ -64,8 +58,6 @@ typedef union {
 typedef struct {
     aggregate_type type;
     column_id column;
-    column_id second_column;
-    double quantile;
 } aggregate_spec;
 
 /* Query descriptions are immutable and contain no pointers. */
@@ -109,20 +101,15 @@ typedef struct {
     size_t key_set;
 } query_layout;
 
-typedef struct exchange_block {
-    struct exchange_block *next;
-    size_t count, word_capacity;
-    uint64_t words[];
-} exchange_block;
-
 typedef struct {
-    exchange_block *first, *last;
-    size_t rows;
+    uint64_t *words;
+    size_t rows, word_capacity;
 } exchange_partition;
 
 /* One direct worker malloc owns this directory and its partition entries.
- * Each payload block is a separate malloc; no large shared parent payload.
- * All mutable partition fields are written in phase 1, read in phase 2. */
+ * Each partition's payload buffer is a separate malloc; no large shared
+ * parent payload. All mutable partition fields are written in phase 1,
+ * read in phase 2. */
 typedef struct worker_mailbox {
     int error;
     exchange_partition partitions[];
@@ -168,23 +155,6 @@ typedef struct {
     const query_layout *layout;
 } group_input;
 
-/* Private group scratch, allocated/reused/freed by the same worker. */
-typedef struct {
-    number left, right;
-    double left_rank, right_rank;
-} statistic_row;
-
-typedef struct {
-    number cell;
-    size_t row;
-} rank_item;
-
-typedef struct {
-    statistic_row *rows;
-    rank_item *items, *scratch;
-    size_t capacity;
-} statistic_workspace;
-
 /* Full output chains never escape their worker. Their allocation site is
  * separate from the shared exchange and preview report allocation sites. */
 typedef struct result_frame {
@@ -200,10 +170,11 @@ typedef struct {
     size_t groups;
 } query_result;
 
-/* Only scalar copies cross the join boundary, never full-result pointers. */
+/* Only scalar copies cross the join boundary, never full-result pointers.
+ * Each preview row is a finished text line; main prints it unchanged. */
 typedef struct {
     size_t groups, rows;
-    uint64_t words[preview_rows][max_result_row_words];
+    char lines[preview_rows][preview_line_bytes];
 } query_preview;
 
 typedef struct worker_report {
@@ -231,7 +202,7 @@ typedef struct worker_input {
     size_t schedule_count, query_count;
 } worker_input;
 
-typedef enum { suite_drust, suite_extended, suite_statistics } query_suite;
+typedef enum { suite_drust, suite_extended } query_suite;
 
 typedef struct {
     input_path path;
@@ -249,8 +220,7 @@ typedef struct {
 static const char column_names[input_columns][4] = {
     "id1", "id2", "id3", "id4", "id5", "id6", "v1", "v2", "v3"};
 static const char aggregate_names[aggregate_type_count][12] = {
-    "sum",      "min",    "max",     "count",    "count_all", "mean",
-    "variance", "stddev", "pearson", "spearman", "quantile"};
+    "sum", "min", "max", "count", "count_all", "mean"};
 
 /* DRust dataframe-ori query operators, with numeric enums replacing
  * column-name strings. Query concurrency is deliberately a separate
@@ -338,54 +308,7 @@ static const query_spec query_specs[query_spec_count] =
       .keys = {column_id3},
       .aggregate_count = 2,
       .aggregates = {{.type = aggregate_mean, .column = column_v3},
-                     {.type = aggregate_count, .column = column_v3}}},
-     {.id = 14,
-      .key_count = 2,
-      .keys = {column_id1, column_id2},
-      .aggregate_count = 1,
-      .aggregates = {{.type = aggregate_spearman,
-                      .column = column_v1,
-                      .second_column = column_v3}}},
-     {.id = 15,
-      .key_count = 2,
-      .keys = {column_id4, column_id5},
-      .aggregate_count = 1,
-      .aggregates = {{.type = aggregate_spearman,
-                      .column = column_v2,
-                      .second_column = column_v3}}},
-     {.id = 16,
-      .key_count = 2,
-      .keys = {column_id2, column_id4},
-      .aggregate_count = 1,
-      .aggregates = {{.type = aggregate_spearman,
-                      .column = column_v1,
-                      .second_column = column_v2}}},
-     {.id = 17,
-      .key_count = 2,
-      .keys = {column_id1, column_id2},
-      .aggregate_count = 3,
-      .aggregates =
-          {{.type = aggregate_quantile, .column = column_v3, .quantile = 0.50},
-           {.type = aggregate_quantile, .column = column_v3, .quantile = 0.90},
-           {.type = aggregate_quantile,
-            .column = column_v3,
-            .quantile = 0.99}}},
-     {.id = 18,
-      .key_count = 2,
-      .keys = {column_id4, column_id5},
-      .aggregate_count = 2,
-      .aggregates = {{.type = aggregate_variance, .column = column_v1},
-                     {.type = aggregate_stddev, .column = column_v3}}},
-     {.id = 19,
-      .key_count = 2,
-      .keys = {column_id2, column_id4},
-      .aggregate_count = 2,
-      .aggregates = {{.type = aggregate_pearson,
-                      .column = column_v1,
-                      .second_column = column_v3},
-                     {.type = aggregate_pearson,
-                      .column = column_v2,
-                      .second_column = column_v3}}}};
+                     {.type = aggregate_count, .column = column_v3}}}};
 
 /* Main initializes these before creating workers and destroys the barrier
  * only after every worker has joined. See worker_entry for phase ordering. */
@@ -422,37 +345,26 @@ int pack_group_indices(const group_input *input, group_indices *groups);
 void free_group_indices(group_indices *groups);
 number aggregate_group(const group_input *input, const group_indices *groups,
                        size_t group, const aggregate_spec *agg, int *valid);
-int prepare_statistics(statistic_workspace *workspace, size_t count);
-int number_less(number left, number right, column_id column);
-double number_as_double(number cell, column_id column);
-void rank_group(statistic_workspace *workspace, size_t count, column_id column,
-                int right_column);
-number select_number(rank_item *items, size_t count, size_t nth,
-                     column_id column);
-number aggregate_statistic(const group_input *input,
-                           const group_indices *groups, size_t group,
-                           size_t agg_index, statistic_workspace *workspace,
-                           int *valid);
 uint64_t *append_exchange(exchange_partition *partition, size_t stride);
 int produce_partitions(const resident_frame *frame, const query_spec *query,
                        const query_layout *layout, worker_mailbox *mailbox,
                        size_t partitions, size_t worker_id);
 result_frame *append_result(query_result *result, const query_spec *query,
                             size_t groups);
+void format_result_row(char *dst, size_t capacity, const result_frame *frame,
+                       const query_spec *query, size_t group);
 void materialize_keys(const group_input *input, const group_indices *groups,
                       result_frame *result);
 int materialize_groups(const group_input *input, const group_indices *groups,
-                       query_result *result, query_preview *preview,
-                       statistic_workspace *workspace);
+                       query_result *result, query_preview *preview);
 int gather_partition(size_t partition, group_input *input,
                      group_indices *groups);
 int consume_partitions(const worker_input *worker, group_input *input,
                        group_indices *groups, query_result *result,
-                       query_preview *preview, statistic_workspace *workspace);
+                       query_preview *preview);
 void free_query_results(query_result *results, size_t query_count);
 void free_exchange(worker_mailbox *mailbox, size_t partitions);
 void *worker_entry(void *argument);
-void print_result_row(const uint64_t *row, const query_spec *query);
 void print_query_results(const query_spec *queries, const size_t *schedule,
                          size_t schedule_count, size_t query_count,
                          const worker_report *reports);
