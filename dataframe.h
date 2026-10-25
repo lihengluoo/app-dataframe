@@ -6,48 +6,57 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-enum {
-    key_columns = 6,
-    input_columns = 9,
-    max_aggregates = 4,
-    max_worker_threads = 4096,
-    preview_rows = 5,
-    preview_line_bytes = 256,
-    csv_buffer_bytes = 65536,
-    initial_partition_words = 256,
-    row_shard_shift = 48,
-    default_thread_count = 8,
-    default_pass_count = 1,
-    drust_query_count = 10,
-    extended_query_count = 13,
-    query_spec_count = 13,
-    drust_query_repeats = 3,
-    drust_schedule_count = 2 + (drust_query_count - 1) * drust_query_repeats
-};
+#define key_columns 6
+#define input_columns 9
+#define max_aggregates 4
+#define max_worker_threads 4096
+#define preview_rows 5
+#define preview_line_bytes 256
+#define csv_buffer_bytes 65536
+#define initial_group_capacity 4
+#define numeric_thread_min_rows 1000
+#define encoded_column_bytes 5
+#define encoded_uint32_bytes 4
+#define numeric_hash_multiplier UINT64_C(0x55fbfd6bfc5458e9)
+#define encoded_hash_basis UINT64_C(0xcbf29ce484222325)
+#define encoded_hash_multiplier UINT64_C(0x100000001b3)
+#define row_shard_shift 48
+#define default_thread_count 8
+#define default_pass_count 1
+#define drust_query_count 10
+#define extended_query_count 13
+#define query_spec_count 13
+#define drust_query_repeats 3
+#define drust_schedule_count (2 + (drust_query_count - 1) * drust_query_repeats)
 
-typedef enum {
-    column_id1,
-    column_id2,
-    column_id3,
-    column_id4,
-    column_id5,
-    column_id6,
-    column_v1,
-    column_v2,
-    column_v3
-} column_id;
+#define column_id1 0
+#define column_id2 1
+#define column_id3 2
+#define column_id4 3
+#define column_id5 4
+#define column_id6 5
+#define column_v1 6
+#define column_v2 7
+#define column_v3 8
 
-typedef enum {
-    aggregate_sum,
-    aggregate_min,
-    aggregate_max,
-    aggregate_count,
-    aggregate_count_all,
-    aggregate_mean,
-    aggregate_type_count
-} aggregate_type;
+#define aggregate_sum 0
+#define aggregate_min 1
+#define aggregate_max 2
+#define aggregate_count_nonnull 3
+#define aggregate_count_all 4
+#define aggregate_mean 5
+#define aggregate_type_count 6
 
-typedef enum { error_none, error_input, error_memory, error_peer } error_code;
+#define error_none 0
+#define error_input 1
+#define error_memory 2
+#define error_peer 3
+
+#define suite_drust 0
+#define suite_extended 1
+
+typedef size_t column_id;
+typedef int aggregate_type;
 
 typedef union {
     uint64_t bits;
@@ -85,7 +94,7 @@ typedef struct {
 } input_range;
 
 /* Original typed columns: owner writes during loading; all workers read after
- * B0. No query writes these arrays. The owner frees them after the final B2. */
+ * publication. No query writes these arrays. Release follows the last query. */
 typedef struct {
     size_t rows;
     uint32_t *keys;
@@ -94,55 +103,31 @@ typedef struct {
     uint16_t *valid;
 } resident_frame;
 
-/* Packet: hash, original row ID, key validity, pairs of UInt32 keys.
- * Measures are accessed only through the original columns during aggregation. */
+/* Composite keys stay in original row order, never hash-routed. The owner
+ * publishes bytes and hashes before partition tasks scan all key slices. */
 typedef struct {
-    size_t packet_words;
-    size_t key_set;
-} query_layout;
-
-typedef struct {
-    uint64_t *words;
-    size_t rows, word_capacity;
-} exchange_partition;
-
-/* One direct worker malloc owns this directory and its partition entries.
- * Each partition's payload buffer is a separate malloc; no large shared
- * parent payload. All mutable partition fields are written in phase 1,
- * read in phase 2. */
-typedef struct worker_mailbox {
+    unsigned char *bytes;
+    uint64_t *hashes;
     int error;
-    exchange_partition partitions[];
-} worker_mailbox;
+} encoded_keys;
 
 typedef struct {
     uint64_t hash;
     size_t group;
 } hash_slot;
 
-/* Packed equivalent of GroupsIdx.first and GroupsIdx.all[g]. */
+/* GroupsIdx.first and GroupsIdx.all[g]. A singleton keeps its row inline,
+ * like Polars' unitvec; larger groups own a growable original-row list. */
 typedef struct {
-    size_t first, begin, count;
-    uint64_t hash;
-    uint32_t keys[key_columns];
-    uint16_t valid;
-} group_span;
-
-typedef struct {
-    size_t group, row_id;
-} group_member;
+    size_t first, count, row_capacity;
+    size_t *row_ids;
+} group_rows;
 
 typedef struct {
     hash_slot *slots;
-    size_t slot_capacity, active_slots;
-    group_span *spans;
+    size_t slot_capacity;
+    group_rows *groups;
     size_t group_count, group_capacity;
-    group_member *members;
-    size_t *row_ids;
-    size_t row_capacity, id_capacity;
-    /* Private capacity hints, indexed by the set of grouping columns.
-     * Only sizes survive; every query rebuilds its groups and row indices. */
-    size_t hash_sizes[1 << key_columns];
 } group_indices;
 
 /* Private directory of immutable original shards; never published to peers.
@@ -150,13 +135,12 @@ typedef struct {
  * This is equivalent to the contiguous original row index plus shard offsets. */
 typedef struct {
     resident_frame *shards;
-    size_t rows;
+    encoded_keys *keys;
+    size_t shard_count, rows;
     const query_spec *query;
-    const query_layout *layout;
 } group_input;
 
-/* Full output chains never escape their worker. Their allocation site is
- * separate from the shared exchange and preview report allocation sites. */
+/* Full output chains never escape their worker. Reports contain only copies. */
 typedef struct result_frame {
     struct result_frame *next;
     size_t groups;
@@ -185,14 +169,16 @@ typedef struct worker_report {
     query_preview queries[];
 } worker_report;
 
-/* Main allocates each argument independently and completes the chain before
- * create. Parameters and next never change afterward. Only the corresponding
- * worker initializes frame and mailbox before B0; peers read only after B0.
- * This reuses an existing object instead of adding publication slots. */
+/* Main completes the argument chain before create. Parameters never change.
+ * Frames and input errors publish once. Composite keys publish before scans;
+ * completed partition groups publish before parallel reduction over groups. */
 typedef struct worker_input {
     struct worker_input *next;
-    worker_mailbox *mailbox;
     resident_frame frame;
+    encoded_keys keys;
+    group_indices *partitions;
+    size_t group_partition_count;
+    int error, query_error;
     const input_path *path;
     const query_spec *queries;
     const size_t *schedule;
@@ -202,7 +188,7 @@ typedef struct worker_input {
     size_t schedule_count, query_count;
 } worker_input;
 
-typedef enum { suite_drust, suite_extended } query_suite;
+typedef int query_suite;
 
 typedef struct {
     input_path path;
@@ -217,18 +203,16 @@ typedef struct {
     size_t count, query_count;
 } query_schedule;
 
-static const char column_names[input_columns][4] = {
+const char column_names[input_columns][4] = {
     "id1", "id2", "id3", "id4", "id5", "id6", "v1", "v2", "v3"};
-static const char aggregate_names[aggregate_type_count][12] = {
+const char aggregate_names[aggregate_type_count][12] = {
     "sum", "min", "max", "count", "count_all", "mean"};
 
-/* DRust dataframe-ori query operators, with numeric enums replacing
- * column-name strings. Query concurrency is deliberately a separate
- * choice: all persistent workers cooperate on each occurrence here.
- * Every query exchanges keys/row IDs and builds complete group indices.
- * Q11..Q13 exercise additional reductions on the same execution path.
- */
-static const query_spec query_specs[query_spec_count] =
+/* DRust dataframe-ori query operators, with numeric column indices.
+ * All workers cooperate on each query. Partition tasks scan original keys
+ * and build complete group indices before any aggregation starts.
+ * Q11..Q13 exercise additional reductions on the same execution path. */
+const query_spec query_specs[query_spec_count] =
     {{.id = 1,
       .key_count = 1,
       .keys = {column_id1},
@@ -293,7 +277,7 @@ static const query_spec query_specs[query_spec_count] =
       .aggregate_count = 4,
       .aggregates = {{.type = aggregate_mean, .column = column_v1},
                      {.type = aggregate_mean, .column = column_v3},
-                     {.type = aggregate_count, .column = column_v3},
+                     {.type = aggregate_count_nonnull, .column = column_v3},
                      {.type = aggregate_max, .column = column_v2}}},
      {.id = 12,
       .key_count = 2,
@@ -308,7 +292,7 @@ static const query_spec query_specs[query_spec_count] =
       .keys = {column_id3},
       .aggregate_count = 2,
       .aggregates = {{.type = aggregate_mean, .column = column_v3},
-                     {.type = aggregate_count, .column = column_v3}}}};
+                     {.type = aggregate_count_nonnull, .column = column_v3}}}};
 
 /* Main initializes these before creating workers and destroys the barrier
  * only after every worker has joined. See worker_entry for phase ordering. */
@@ -327,43 +311,44 @@ int parse_csv_number(const char *text, size_t column, number *parsed,
                      int *valid);
 int read_csv_row(csv_reader *reader, number *cells, uint16_t *valid);
 int load_input_shard(const worker_input *input, resident_frame *frame);
-query_layout prepare_query_layout(const query_spec *query);
 size_t original_row_offset(size_t row_id);
 const resident_frame *original_shard(const group_input *input, size_t row_id);
 number original_measure(const resident_frame *shard, size_t row,
                         column_id column);
 uint64_t mix_hash(uint64_t hash);
 size_t key_partition(uint64_t hash, size_t partitions);
-uint32_t packet_key(const uint64_t *packet, size_t key);
-int group_keys_equal(const query_spec *query, const uint64_t *packet,
-                     const group_span *span);
+uint64_t hash_numeric_key(const resident_frame *frame, size_t row,
+                          column_id column);
+uint64_t hash_key_bytes(const unsigned char *bytes, size_t count);
+int encode_group_keys(const resident_frame *frame, const query_spec *query,
+                      encoded_keys *keys);
+int group_keys_equal(const group_input *input, size_t left_id, size_t right_id);
 int resize_group_hash(group_indices *groups, size_t capacity);
-int prepare_group_indices(const group_input *input, group_indices *groups);
-int index_group_row(const group_input *input, group_indices *groups, size_t row,
-                    const uint64_t *packet);
-int pack_group_indices(const group_input *input, group_indices *groups);
+int append_group_row(group_rows *group, size_t row_id);
+int index_group_row(const group_input *input, group_indices *groups,
+                    size_t row_id, uint64_t hash);
 void free_group_indices(group_indices *groups);
 number aggregate_group(const group_input *input, const group_indices *groups,
                        size_t group, const aggregate_spec *agg, int *valid);
-uint64_t *append_exchange(exchange_partition *partition, size_t stride);
-int produce_partitions(const resident_frame *frame, const query_spec *query,
-                       const query_layout *layout, worker_mailbox *mailbox,
-                       size_t partitions, size_t worker_id);
 result_frame *append_result(query_result *result, const query_spec *query,
                             size_t groups);
+size_t append_field(char *dst, size_t capacity, size_t used,
+                    const char *format, ...);
 void format_result_row(char *dst, size_t capacity, const result_frame *frame,
                        const query_spec *query, size_t group);
 void materialize_keys(const group_input *input, const group_indices *groups,
                       result_frame *result);
 int materialize_groups(const group_input *input, const group_indices *groups,
                        query_result *result, query_preview *preview);
-int gather_partition(size_t partition, group_input *input,
-                     group_indices *groups);
-int consume_partitions(const worker_input *worker, group_input *input,
-                       group_indices *groups, query_result *result,
-                       query_preview *preview);
+int group_partition(const group_input *input, size_t partition,
+                    size_t partition_count, group_indices *groups);
+int build_partition_groups(worker_input *worker, const group_input *input,
+                           size_t partition_count);
+int collect_group_slice(const worker_input *worker, group_indices *groups);
+void free_partition_groups(worker_input *worker);
 void free_query_results(query_result *results, size_t query_count);
-void free_exchange(worker_mailbox *mailbox, size_t partitions);
+int read_input_shards(group_input *input);
+int read_encoded_keys(group_input *input);
 void *worker_entry(void *argument);
 void print_query_results(const query_spec *queries, const size_t *schedule,
                          size_t schedule_count, size_t query_count,

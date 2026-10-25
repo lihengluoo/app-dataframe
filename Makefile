@@ -13,11 +13,14 @@ ir_dir ?= $(build_dir)/ir
 compile_flags := -D_POSIX_C_SOURCE=200809L -std=c11 -Wall -Wextra -Werror \
                  -Wpedantic -Wstrict-prototypes -Wmissing-prototypes -pthread
 
-.PHONY: all benchmark ir clean
+.PHONY: all benchmark test ir clean
 
 all: benchmark
 
 benchmark: $(build_dir)/dataframe
+
+test: benchmark
+	python3 tests/test_dataframe.py $(build_dir)/dataframe
 
 $(build_dir)/dataframe: dataframe.c dataframe.h | $(build_dir)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(compile_flags) dataframe.c $(LDFLAGS) $(LDLIBS) -lm -o $@

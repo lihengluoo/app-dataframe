@@ -1,10 +1,36 @@
 # Dataframe group-by benchmark
 
 C11 numeric group-by and aggregation benchmark adapted from the Polars
-rs-0.51.0 kernels. Persistent pthread workers load separate CSV shards,
-exchange grouping keys and original row IDs through hash partitions, and
-build complete group indices before aggregating the original columns.
-Barriers separate input loading, exchange writes, and exchange reads.
+rs-0.51.0 kernels. Persistent pthread workers load separate CSV shards and
+publish immutable typed columns. Grouping follows Polars'
+`group_by_threaded_slice` / `group_by_threaded_iter` execution model:
+
+1. Single-column queries read the original numeric keys directly. Composite
+   queries prepare row-encoded keys and hashes in original input order.
+2. Each hash-partition task scans **all** input key slices, ignores rows
+   outside its partition, and builds a private hash map. There is no
+   producer-to-consumer packet exchange or hash-routed copy of the input.
+3. Each group keeps its original row IDs, appending directly to a growable
+   list with singleton membership inline. Every partition/query starts
+   with a new map; no capacities or group contents survive another query.
+4. After all partition maps finish, workers collect disjoint slices of the
+   complete unsorted group collection. Key materialization and numeric
+   reductions independently read original columns through those indices;
+   `count(column)` reads validity and `count(*)` uses the group's length.
+   Reduction work is not tied to the worker that built a partition.
+
+Barriers publish inputs, publish composite-key preparation when needed,
+complete grouping before reductions, and finish group readers before
+cleanup. One worker uses one map. With multiple workers, numeric grouping
+uses one map for at most 1,000 input rows, matching Polars' numeric threading
+threshold. Larger numeric inputs and composite queries use the configured
+partition count.
+
+This is a standalone numeric C adaptation, not a linked Polars engine. Its
+hash table and deterministic composite-byte hasher replace the Rust
+backends; unsorted group order is not intended to match Polars byte-for-byte.
+The query schedule, CSV driver and saved-result lifetime are benchmark
+choices rather than grouping-kernel requirements.
 
 Each worker keeps its full columnar query results until the last query
 finishes. Main prints group counts and up to five unsorted rows per query;
@@ -18,9 +44,14 @@ Commands below run from the Delphi repository root:
 
 ```sh
 make -C applications/dataframe
+make -C applications/dataframe test
 applications/dataframe/build/dataframe --help
 applications/dataframe/build/dataframe --threads 4 --suite extended input.csv
 ```
+
+The Python-standard-library regression checks all 13 queries against an
+independent aggregate calculation, repeated passes, nulls, uneven worker/
+partition counts, hash/list growth, empty input shards and malformed CSV.
 
 The Makefile also builds directly from this submodule with `make`.
 `build_dir`, `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, and `LDLIBS` can be
@@ -82,7 +113,8 @@ definitions live in `dataframe.h`:
 Reductions return doubles except counts.
 
 The final line reports processed rows, elapsed milliseconds, and throughput.
-`query_ms` spans the worker query loop and workspace/exchange cleanup.
+`query_ms` spans key preparation, grouping, reductions, synchronization,
+and temporary grouping/key cleanup.
 `application_ms` also includes input loading, thread creation/join, preview
 printing, and release of input columns and full results.
 

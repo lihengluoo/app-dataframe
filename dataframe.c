@@ -2,7 +2,7 @@
  * Numeric C port of Polars' group-index and aggregation kernels, rs-0.51.0.
  *
  * Upstream, https://github.com/pola-rs/polars/tree/rs-0.51.0:
- *   crates/polars-core/src/frame/group_by/hashing.rs: group_by
+ *   crates/polars-core/src/frame/group_by/hashing.rs: group_by_threaded_slice/iter
  *   crates/polars-core/src/frame/group_by/position.rs: GroupsIdx
  *   crates/polars-core/src/frame/group_by/aggregations/mod.rs: agg_sum/min/max/mean
  */
@@ -362,16 +362,6 @@ int load_input_shard(const worker_input *input, resident_frame *frame)
     return error;
 }
 
-query_layout prepare_query_layout(const query_spec *query)
-{
-    query_layout layout = {0};
-    for (size_t key = 0; key < query->key_count; ++key) {
-        layout.key_set |= (size_t)1 << query->keys[key];
-    }
-    layout.packet_words = 3 + (query->key_count + 1) / 2;
-    return layout;
-}
-
 size_t original_row_offset(size_t row_id)
 {
     return row_id & ((UINT64_C(1) << row_shard_shift) - 1);
@@ -392,8 +382,8 @@ number original_measure(const resident_frame *shard, size_t row,
         .integer = shard->integers[(column - column_v1) * shard->rows + row]};
 }
 
-/* The hash-table backend is the C adaptation, not Polars' hashbrown backend.
- * Re-mixing before the table mask avoids reusing partition-selected low bits. */
+/* The C hash-table backend replaces hashbrown. Mix independently for bucket
+ * selection rather than using the partition hash directly as a table index. */
 uint64_t mix_hash(uint64_t hash)
 {
     hash ^= hash >> 30;
@@ -403,25 +393,98 @@ uint64_t mix_hash(uint64_t hash)
     return hash ^ (hash >> 31);
 }
 
-/* All keys use the same tuple hash to select a partition. */
+/* Polars hash_to_partition takes the high half of hash * partitions.
+ * Use 32-bit limbs so this remains C11 without a compiler-specific type. */
 size_t key_partition(uint64_t hash, size_t partitions)
 {
-    return (size_t)(hash % partitions);
+    uint64_t count = partitions;
+    uint64_t low = (uint64_t)(uint32_t)hash * (uint32_t)count;
+    uint64_t middle = (hash >> 32) * (uint32_t)count + (low >> 32);
+    uint64_t upper = (uint64_t)(uint32_t)hash * (count >> 32) +
+                     (uint32_t)middle;
+    return (size_t)((hash >> 32) * (count >> 32) + (middle >> 32) +
+                    (upper >> 32));
 }
 
-uint32_t packet_key(const uint64_t *packet, size_t key)
+uint64_t hash_numeric_key(const resident_frame *frame, size_t row,
+                          column_id column)
 {
-    return (uint32_t)(packet[3 + key / 2] >> (32 * (key % 2)));
+    return frame->valid[row] & (1u << column) ?
+               (uint64_t)frame->keys[column * frame->rows + row] *
+                   numeric_hash_multiplier :
+               0;
 }
 
-int group_keys_equal(const query_spec *query, const uint64_t *packet,
-                     const group_span *span)
+uint64_t hash_key_bytes(const unsigned char *bytes, size_t count)
 {
-    if (packet[2] != span->valid) {
-        return 0;
+    uint64_t hash = encoded_hash_basis;
+    for (size_t index = 0; index < count; ++index) {
+        hash = (hash ^ bytes[index]) * encoded_hash_multiplier;
+    }
+    return mix_hash(hash);
+}
+
+/* Numeric subset of Polars' unordered row encoding: one validity byte and
+ * four big-endian bytes per UInt32 column, in original input row order. */
+int encode_group_keys(const resident_frame *frame, const query_spec *query,
+                      encoded_keys *keys)
+{
+    size_t row_bytes = query->key_count * encoded_column_bytes;
+    if (frame->rows == 0) {
+        return error_none;
+    }
+    if (frame->rows > SIZE_MAX / row_bytes ||
+        frame->rows > SIZE_MAX / sizeof(uint64_t)) {
+        return error_memory;
+    }
+    keys->bytes = malloc(frame->rows * row_bytes);
+    keys->hashes = malloc(frame->rows * sizeof(*keys->hashes));
+    if (!keys->bytes || !keys->hashes) {
+        return error_memory;
     }
     for (size_t key = 0; key < query->key_count; ++key) {
-        if (packet_key(packet, key) != span->keys[key]) {
+        size_t column = query->keys[key];
+        for (size_t row = 0; row < frame->rows; ++row) {
+            unsigned char *bytes = keys->bytes + row * row_bytes +
+                                   key * encoded_column_bytes;
+            unsigned present = (frame->valid[row] >> column) & 1u;
+            uint32_t cell = present ? frame->keys[column * frame->rows + row] : 0;
+            bytes[0] = (unsigned char)present;
+            for (size_t byte = 0; byte < encoded_uint32_bytes; ++byte) {
+                size_t shift = 8 * (encoded_uint32_bytes - 1 - byte);
+                bytes[1 + byte] = (unsigned char)(cell >> shift);
+            }
+        }
+    }
+    for (size_t row = 0; row < frame->rows; ++row) {
+        keys->hashes[row] = hash_key_bytes(keys->bytes + row * row_bytes, row_bytes);
+    }
+    return error_none;
+}
+
+int group_keys_equal(const group_input *input, size_t left_id, size_t right_id)
+{
+    if (input->query->key_count > 1) {
+        size_t row_bytes = input->query->key_count * encoded_column_bytes;
+        const unsigned char *left =
+            input->keys[left_id >> row_shard_shift].bytes +
+            original_row_offset(left_id) * row_bytes;
+        const unsigned char *right =
+            input->keys[right_id >> row_shard_shift].bytes +
+            original_row_offset(right_id) * row_bytes;
+        return memcmp(left, right, row_bytes) == 0;
+    }
+    const resident_frame *left = original_shard(input, left_id);
+    const resident_frame *right = original_shard(input, right_id);
+    size_t left_row = original_row_offset(left_id);
+    size_t right_row = original_row_offset(right_id);
+    for (size_t key = 0; key < input->query->key_count; ++key) {
+        size_t column = input->query->keys[key];
+        unsigned left_valid = (left->valid[left_row] >> column) & 1u;
+        unsigned right_valid = (right->valid[right_row] >> column) & 1u;
+        if (left_valid != right_valid ||
+            (left_valid && left->keys[column * left->rows + left_row] !=
+                               right->keys[column * right->rows + right_row])) {
             return 0;
         }
     }
@@ -430,178 +493,149 @@ int group_keys_equal(const query_spec *query, const uint64_t *packet,
 
 int resize_group_hash(group_indices *groups, size_t capacity)
 {
-    hash_slot *slots = groups->slots;
-    if (capacity > groups->slot_capacity) {
-        if (capacity > SIZE_MAX / sizeof(*slots)) {
-            return error_memory;
-        }
-        slots = malloc(capacity * sizeof(*slots));
-        if (!slots) {
-            return error_memory;
-        }
-        free(groups->slots);
-        groups->slots = slots;
-        groups->slot_capacity = capacity;
+    if (capacity > SIZE_MAX / sizeof(hash_slot)) {
+        return error_memory;
+    }
+    hash_slot *slots = malloc(capacity * sizeof(*slots));
+    if (!slots) {
+        return error_memory;
     }
     for (size_t index = 0; index < capacity; ++index) {
         slots[index].group = SIZE_MAX;
     }
-    for (size_t index = 0; index < groups->group_count; ++index) {
-        uint64_t hash = groups->spans[index].hash;
-        size_t slot = (size_t)mix_hash(hash) & (capacity - 1);
-        while (slots[slot].group != SIZE_MAX) {
-            slot = (slot + 1) & (capacity - 1);
+    for (size_t index = 0; index < groups->slot_capacity; ++index) {
+        const hash_slot *previous = &groups->slots[index];
+        if (previous->group != SIZE_MAX) {
+            size_t slot = (size_t)mix_hash(previous->hash) & (capacity - 1);
+            while (slots[slot].group != SIZE_MAX) {
+                slot = (slot + 1) & (capacity - 1);
+            }
+            slots[slot] = *previous;
         }
-        slots[slot] = (hash_slot){.hash = hash, .group = index};
     }
+    free(groups->slots);
+    groups->slots = slots;
+    groups->slot_capacity = capacity;
     return error_none;
 }
 
-/* Reuse the last capacity for these grouping columns, not the contents.
- * A repeated high-cardinality query avoids the entire doubling sequence;
- * a low-cardinality query still clears only its own small active table. */
-int prepare_group_indices(const group_input *input, group_indices *groups)
+int append_group_row(group_rows *group, size_t row_id)
 {
-    groups->group_count = 0;
-    groups->active_slots = groups->hash_sizes[input->layout->key_set];
-    if (groups->active_slots == 0) {
-        groups->active_slots = 64;
-    }
-    if (input->rows == 0) {
-        return error_none;
-    }
-    if (input->rows > groups->row_capacity) {
-        if (input->rows > SIZE_MAX / sizeof(group_member)) {
-            return error_memory;
+    if (group->count == 0) {
+        group->first = row_id;
+    } else {
+        if (group->count >= group->row_capacity) {
+            size_t capacity = group->row_capacity ? group->row_capacity * 2 : 2;
+            if (capacity < group->row_capacity ||
+                capacity > SIZE_MAX / sizeof(size_t)) {
+                return error_memory;
+            }
+            size_t *row_ids = malloc(capacity * sizeof(*row_ids));
+            if (!row_ids) {
+                return error_memory;
+            }
+            row_ids[0] = group->first;
+            for (size_t index = 1; index < group->count; ++index) {
+                row_ids[index] = group->row_ids[index];
+            }
+            free(group->row_ids);
+            group->row_ids = row_ids;
+            group->row_capacity = capacity;
         }
-        group_member *rows = malloc(input->rows * sizeof(*rows));
-        if (!rows) {
-            return error_memory;
-        }
-        free(groups->members);
-        groups->members = rows;
-        groups->row_capacity = input->rows;
+        group->row_ids[group->count] = row_id;
     }
-    return resize_group_hash(groups, groups->active_slots);
+    ++group->count;
+    return error_none;
 }
 
-/* Polars hashing.rs::group_by: a new key starts a row-ID list; an existing
- * key appends to its list. Read incoming keys directly while B1/B2 protects
- * the packet; only a new group's representative key is copied privately.
- * No packet pointer is retained. Collisions compare the complete key. */
-int index_group_row(const group_input *input, group_indices *groups, size_t row,
-                    const uint64_t *packet)
+/* Like hashing.rs, append original row IDs directly to the matching group.
+ * Numeric collisions compare typed cells; composite collisions compare the
+ * prepared row bytes rather than copying another tuple into each group. */
+int index_group_row(const group_input *input, group_indices *groups,
+                    size_t row_id, uint64_t hash)
 {
-    uint64_t hash = packet[0];
-    size_t slot = (size_t)mix_hash(hash) & (groups->active_slots - 1);
+    if (groups->slot_capacity == 0 &&
+        resize_group_hash(groups, initial_group_capacity)) {
+        return error_memory;
+    }
+    size_t slot = (size_t)mix_hash(hash) & (groups->slot_capacity - 1);
     while (groups->slots[slot].group != SIZE_MAX) {
         size_t group = groups->slots[slot].group;
         if (groups->slots[slot].hash == hash &&
-            group_keys_equal(input->query, packet, &groups->spans[group])) {
+            group_keys_equal(input, row_id, groups->groups[group].first)) {
             break;
         }
-        slot = (slot + 1) & (groups->active_slots - 1);
+        slot = (slot + 1) & (groups->slot_capacity - 1);
     }
     if (groups->slots[slot].group == SIZE_MAX) {
         if (groups->group_count + 1 >
-            groups->active_slots - groups->active_slots / 4) {
-            if (groups->active_slots > SIZE_MAX / 2 ||
-                resize_group_hash(groups, groups->active_slots * 2)) {
+            groups->slot_capacity - groups->slot_capacity / 4) {
+            if (groups->slot_capacity > SIZE_MAX / 2 ||
+                resize_group_hash(groups, groups->slot_capacity * 2)) {
                 return error_memory;
             }
-            groups->active_slots *= 2;
-            slot = (size_t)mix_hash(hash) & (groups->active_slots - 1);
+            slot = (size_t)mix_hash(hash) & (groups->slot_capacity - 1);
             while (groups->slots[slot].group != SIZE_MAX) {
-                slot = (slot + 1) & (groups->active_slots - 1);
+                slot = (slot + 1) & (groups->slot_capacity - 1);
             }
         }
         if (groups->group_count == groups->group_capacity) {
-            size_t capacity =
-                groups->group_capacity ? groups->group_capacity * 2 : 64;
+            size_t capacity = groups->group_capacity ?
+                                  groups->group_capacity * 2 :
+                                  initial_group_capacity;
             if (capacity < groups->group_capacity ||
-                capacity > SIZE_MAX / sizeof(group_span)) {
+                capacity > SIZE_MAX / sizeof(group_rows)) {
                 return error_memory;
             }
-            group_span *spans = malloc(capacity * sizeof(*spans));
-            if (!spans) {
+            group_rows *rows = malloc(capacity * sizeof(*rows));
+            if (!rows) {
                 return error_memory;
             }
             for (size_t index = 0; index < groups->group_count; ++index) {
-                spans[index] = groups->spans[index];
+                rows[index] = groups->groups[index];
             }
-            free(groups->spans);
-            groups->spans = spans;
+            free(groups->groups);
+            groups->groups = rows;
             groups->group_capacity = capacity;
         }
         size_t group = groups->group_count++;
-        groups->spans[group] = (group_span){
-            .first = packet[1], .hash = hash, .valid = (uint16_t)packet[2]};
+        groups->groups[group] = (group_rows){0};
         groups->slots[slot] = (hash_slot){.hash = hash, .group = group};
-        for (size_t key = 0; key < input->query->key_count; ++key) {
-            groups->spans[group].keys[key] = packet_key(packet, key);
-        }
     }
-    size_t group = groups->slots[slot].group;
-    groups->members[row] = (group_member){.group = group, .row_id = packet[1]};
-    ++groups->spans[group].count;
-    return error_none;
-}
-
-/* Packed equivalent of GroupsIdx: first is the representative row, and
- * row_ids[begin .. begin+count) holds every original member, including all
- * singleton groups. No query reuses another query's group contents. */
-int pack_group_indices(const group_input *input, group_indices *groups)
-{
-    if (input->rows > groups->id_capacity) {
-        size_t *ids = malloc(input->rows * sizeof(*ids));
-        if (!ids) {
-            return error_memory;
-        }
-        free(groups->row_ids);
-        groups->row_ids = ids;
-        groups->id_capacity = input->rows;
-    }
-    size_t begin = 0;
-    for (size_t group = 0; group < groups->group_count; ++group) {
-        group_span *span = &groups->spans[group];
-        span->begin = begin;
-        begin += span->count;
-        span->count = 0;
-    }
-    for (size_t row = 0; row < input->rows; ++row) {
-        group_span *span = &groups->spans[groups->members[row].group];
-        groups->row_ids[span->begin + span->count++] =
-            groups->members[row].row_id;
-    }
-    return error_none;
+    return append_group_row(&groups->groups[groups->slots[slot].group], row_id);
 }
 
 void free_group_indices(group_indices *groups)
 {
+    for (size_t group = 0; group < groups->group_count; ++group) {
+        free(groups->groups[group].row_ids);
+    }
     free(groups->slots);
-    free(groups->spans);
-    free(groups->members);
-    free(groups->row_ids);
+    free(groups->groups);
 }
 
-/* Each aggregate makes its own complete traversal of original row IDs.
- * Like DRust, SUM/MIN produce Float64 even for an Int32 input column.
- * Original cells have fixed types; no temporary byte vector is allocated. */
+/* Each reduction traverses its original row IDs independently. Count(*)
+ * uses the complete group's length; count(column) reads only validity.
+ * The benchmark keeps DRust's Float64 interface for numeric reductions. */
 number aggregate_group(const group_input *input, const group_indices *groups,
                        size_t group, const aggregate_spec *agg, int *valid)
 {
-    const group_span *span = &groups->spans[group];
+    const group_rows *rows = &groups->groups[group];
+    if (agg->type == aggregate_count_all) {
+        *valid = 1;
+        return (number){.bits = rows->count};
+    }
     size_t count = 0;
     double accumulated = 0.0;
-    for (size_t offset = 0; offset < span->count; ++offset) {
-        size_t row_id = groups->row_ids[span->begin + offset];
+    for (size_t offset = 0; offset < rows->count; ++offset) {
+        size_t row_id = rows->count == 1 ? rows->first : rows->row_ids[offset];
         const resident_frame *shard = original_shard(input, row_id);
         size_t row = original_row_offset(row_id);
-        if (agg->type == aggregate_count_all) {
-            ++count;
+        if (!(shard->valid[row] & (1u << agg->column))) {
             continue;
         }
-        if (!(shard->valid[row] & (1u << agg->column))) {
+        if (agg->type == aggregate_count_nonnull) {
+            ++count;
             continue;
         }
         number cell = original_measure(shard, row, agg->column);
@@ -617,8 +651,8 @@ number aggregate_group(const group_input *input, const group_indices *groups,
         ++count;
     }
     *valid = count != 0 || agg->type == aggregate_sum ||
-             agg->type == aggregate_count || agg->type == aggregate_count_all;
-    if (agg->type == aggregate_count || agg->type == aggregate_count_all) {
+             agg->type == aggregate_count_nonnull;
+    if (agg->type == aggregate_count_nonnull) {
         return (number){.bits = count};
     }
     if (agg->type == aggregate_mean && count) {
@@ -627,82 +661,9 @@ number aggregate_group(const group_input *input, const group_indices *groups,
     return (number){.real = accumulated};
 }
 
-/* Only the producer calls this appender and writes the returned packet.
- * One flat buffer per partition doubles on demand; its capacity survives
- * across queries while the row count resets after the read-done barrier. */
-uint64_t *append_exchange(exchange_partition *partition, size_t stride)
-{
-    if (partition->rows == SIZE_MAX / stride) {
-        return NULL;
-    }
-    size_t needed = (partition->rows + 1) * stride;
-    if (needed > partition->word_capacity) {
-        size_t capacity = partition->word_capacity * 2;
-        if (capacity < needed) {
-            capacity = needed;
-        }
-        if (capacity > SIZE_MAX / sizeof(uint64_t)) {
-            return NULL;
-        }
-        uint64_t *words = malloc(capacity * sizeof(*words));
-        if (!words) {
-            return NULL;
-        }
-        if (partition->rows) {
-            memcpy(words, partition->words, partition->rows * stride *
-                          sizeof(*words));
-        }
-        free(partition->words);
-        partition->words = words;
-        partition->word_capacity = capacity;
-    }
-    uint64_t *packet = partition->words + partition->rows * stride;
-    ++partition->rows;
-    return packet;
-}
-
-/* Read the resident shard once for this query. Each raw row goes to exactly
- * one hash partition; only selected keys and the original row ID travel. */
-int produce_partitions(const resident_frame *frame, const query_spec *query,
-                       const query_layout *layout, worker_mailbox *mailbox,
-                       size_t partitions, size_t worker_id)
-{
-    for (size_t row = 0; row < frame->rows; ++row) {
-        uint64_t keys[key_columns], mask = 0;
-        uint16_t valid = frame->valid[row];
-        for (size_t key = 0; key < query->key_count; ++key) {
-            size_t column = query->keys[key];
-            unsigned present = (valid >> column) & 1;
-            mask |= (uint64_t)present << key;
-            keys[key] = present ? frame->keys[column * frame->rows + row] : 0;
-        }
-        uint64_t hash = mix_hash(mask + UINT64_C(0x9e3779b97f4a7c15));
-        for (size_t key = 0; key < query->key_count; ++key) {
-            hash = mix_hash(hash ^ mix_hash(keys[key] + key +
-                                            UINT64_C(0x9e3779b97f4a7c15)));
-        }
-        size_t partition = key_partition(hash, partitions);
-        uint64_t *packet = append_exchange(&mailbox->partitions[partition],
-                                           layout->packet_words);
-        if (!packet) {
-            return error_memory;
-        }
-        packet[0] = hash;
-        packet[1] = (worker_id << row_shard_shift) | row;
-        packet[2] = mask;
-        for (size_t key = 0; key < query->key_count; key += 2) {
-            packet[3 + key / 2] = keys[key];
-            if (key + 1 < query->key_count) {
-                packet[3 + key / 2] |= keys[key + 1] << 32;
-            }
-        }
-    }
-    return error_none;
-}
-
-/* Full columnar output, allocated exactly once per partition/query. Numeric
- * columns are doubles (except explicit counts); keys retain UInt32. Results
- * stay alive through the last query, just like the Rust result DataFrames. */
+/* Full columnar output for one worker's slice of the completed group index.
+ * Numeric columns are doubles (except counts); keys keep UInt32. Results
+ * stay alive through the last query under the benchmark driver policy. */
 result_frame *append_result(query_result *result, const query_spec *query,
                             size_t groups)
 {
@@ -732,8 +693,8 @@ result_frame *append_result(query_result *result, const query_spec *query,
 
 /* Appends one formatted field and returns the new end offset, stopping at
  * the line capacity. */
-static size_t append_field(char *dst, size_t capacity, size_t used,
-                           const char *format, ...)
+size_t append_field(char *dst, size_t capacity, size_t used,
+                    const char *format, ...)
 {
     va_list args;
     va_start(args, format);
@@ -770,7 +731,8 @@ void format_result_row(char *dst, size_t capacity, const result_frame *frame,
         }
         const aggregate_spec *agg = &query->aggregates[index];
         number cell = frame->aggregates[index * frame->groups + group];
-        if (agg->type == aggregate_count || agg->type == aggregate_count_all) {
+        if (agg->type == aggregate_count_nonnull ||
+            agg->type == aggregate_count_all) {
             used = append_field(dst, capacity, used, "%" PRIu64, cell.bits);
         } else {
             used = append_field(dst, capacity, used, "%.17g", cell.real);
@@ -793,7 +755,7 @@ void materialize_keys(const group_input *input, const group_indices *groups,
     for (size_t key = 0; key < input->query->key_count; ++key) {
         size_t column = input->query->keys[key];
         for (size_t group = 0; group < groups->group_count; ++group) {
-            size_t row_id = groups->spans[group].first;
+            size_t row_id = groups->groups[group].first;
             const resident_frame *shard = original_shard(input, row_id);
             size_t row = original_row_offset(row_id);
             result->keys[key * result->groups + group] =
@@ -832,66 +794,120 @@ int materialize_groups(const group_input *input, const group_indices *groups,
     return error_none;
 }
 
-/* Build the complete key -> ORIGINAL row IDs map without reading measures.
- * Cached tuple keys are for hash collision comparisons only. Output keys
- * are taken again from the original key columns in materialize_keys. */
-int gather_partition(size_t partition, group_input *input,
-                     group_indices *groups)
+/* hashing.rs::group_by_threaded_slice/iter: every partition scans all key
+ * slices and only inserts matching rows into its own new map. */
+int group_partition(const group_input *input, size_t partition,
+                    size_t partition_count, group_indices *groups)
 {
-    size_t stride = input->layout->packet_words;
-    input->rows = 0;
-    for (const worker_input *worker = worker_inputs; worker;
-         worker = worker->next) {
-        size_t count = worker->mailbox->partitions[partition].rows;
-        if (count > SIZE_MAX - input->rows) {
-            return error_memory;
-        }
-        input->rows += count;
-    }
-    int error = prepare_group_indices(input, groups);
-    if (error) {
-        return error;
-    }
-    size_t row = 0;
-    for (const worker_input *worker = worker_inputs; worker;
-         worker = worker->next) {
-        const exchange_partition *part = &worker->mailbox->partitions[partition];
-        for (size_t index = 0; index < part->rows; ++index) {
-            error = index_group_row(input, groups, row++,
-                                    part->words + index * stride);
-            if (error) {
-                return error;
+    for (size_t shard = 0; shard < input->shard_count; ++shard) {
+        const resident_frame *frame = &input->shards[shard];
+        for (size_t row = 0; row < frame->rows; ++row) {
+            uint64_t hash = input->query->key_count == 1 ?
+                                hash_numeric_key(frame, row,
+                                                 input->query->keys[0]) :
+                                input->keys[shard].hashes[row];
+            if (key_partition(hash, partition_count) == partition) {
+                size_t row_id = (shard << row_shard_shift) | row;
+                int error = index_group_row(input, groups, row_id, hash);
+                if (error) {
+                    return error;
+                }
             }
         }
     }
-    groups->hash_sizes[input->layout->key_set] = groups->active_slots;
-    return pack_group_indices(input, groups);
+    free(groups->slots);
+    groups->slots = NULL;
+    groups->slot_capacity = 0;
+    return error_none;
 }
 
-int consume_partitions(const worker_input *worker, group_input *input,
-                       group_indices *groups, query_result *result,
-                       query_preview *preview)
+int build_partition_groups(worker_input *worker, const group_input *input,
+                           size_t partition_count)
 {
-    for (const worker_input *peer_input = worker_inputs; peer_input;
-         peer_input = peer_input->next) {
-        const worker_mailbox *peer = peer_input->mailbox;
-        if (!peer || peer->error) {
-            return error_peer;
-        }
+    size_t count = worker->worker_id < partition_count ?
+                       1 + (partition_count - 1 - worker->worker_id) /
+                               worker->thread_count :
+                       0;
+    worker->partitions = NULL;
+    worker->group_partition_count = 0;
+    if (count == 0) {
+        return error_none;
     }
-    for (size_t partition = worker->worker_id;
-         partition < worker->partition_count;
-         partition += worker->thread_count) {
-        int error = gather_partition(partition, input, groups);
-        if (!error) {
-            error =
-                materialize_groups(input, groups, result, preview);
-        }
+    if (count > SIZE_MAX / sizeof(group_indices)) {
+        return error_memory;
+    }
+    worker->partitions = malloc(count * sizeof(*worker->partitions));
+    if (!worker->partitions) {
+        return error_memory;
+    }
+    worker->group_partition_count = count;
+    for (size_t index = 0; index < count; ++index) {
+        worker->partitions[index] = (group_indices){0};
+    }
+    for (size_t index = 0; index < count; ++index) {
+        size_t partition = worker->worker_id + index * worker->thread_count;
+        int error = group_partition(input, partition, partition_count,
+                                    &worker->partitions[index]);
         if (error) {
             return error;
         }
     }
     return error_none;
+}
+
+/* finish_group_order collects complete groups before any reduction. Each
+ * worker takes a disjoint slice of the unsorted collection, independently
+ * of which partition task built a group. Row lists remain shared read-only. */
+int collect_group_slice(const worker_input *worker, group_indices *groups)
+{
+    size_t total = 0;
+    for (const worker_input *peer = worker_inputs; peer; peer = peer->next) {
+        if (peer->query_error) {
+            return error_peer;
+        }
+        for (size_t index = 0; index < peer->group_partition_count; ++index) {
+            total += peer->partitions[index].group_count;
+        }
+    }
+    size_t per_worker = total / worker->thread_count;
+    size_t extra = total % worker->thread_count;
+    size_t begin = worker->worker_id * per_worker +
+                   (worker->worker_id < extra ? worker->worker_id : extra);
+    size_t count = per_worker + (worker->worker_id < extra);
+    if (count == 0) {
+        return error_none;
+    }
+    if (count > SIZE_MAX / sizeof(group_rows)) {
+        return error_memory;
+    }
+    groups->groups = malloc(count * sizeof(*groups->groups));
+    if (!groups->groups) {
+        return error_memory;
+    }
+    size_t offset = 0;
+    for (const worker_input *peer = worker_inputs; peer; peer = peer->next) {
+        for (size_t index = 0; index < peer->group_partition_count; ++index) {
+            const group_indices *partition = &peer->partitions[index];
+            size_t first = begin > offset ? begin - offset : 0;
+            for (size_t group = first;
+                 group < partition->group_count && groups->group_count < count;
+                 ++group) {
+                groups->groups[groups->group_count++] = partition->groups[group];
+            }
+            offset += partition->group_count;
+        }
+    }
+    return error_none;
+}
+
+void free_partition_groups(worker_input *worker)
+{
+    for (size_t index = 0; index < worker->group_partition_count; ++index) {
+        free_group_indices(&worker->partitions[index]);
+    }
+    free(worker->partitions);
+    worker->partitions = NULL;
+    worker->group_partition_count = 0;
 }
 
 void free_query_results(query_result *results, size_t query_count)
@@ -910,41 +926,44 @@ void free_query_results(query_result *results, size_t query_count)
     free(results);
 }
 
-void free_exchange(worker_mailbox *mailbox, size_t partitions)
+int read_input_shards(group_input *input)
 {
-    if (!mailbox) {
-        return;
+    for (const worker_input *peer = worker_inputs; peer; peer = peer->next) {
+        if (peer->error) {
+            return error_peer;
+        }
+        if (peer->frame.rows > SIZE_MAX - input->rows) {
+            return error_memory;
+        }
+        input->shards[peer->worker_id] = peer->frame;
+        input->rows += peer->frame.rows;
     }
-    for (size_t partition = 0; partition < partitions; ++partition) {
-        free(mailbox->partitions[partition].words);
-    }
-    free(mailbox);
+    return error_none;
 }
 
-/* All barrier waits live here. No computational helper waits, creates a
- * thread, or reads a peer mailbox during the producer phase. Main initializes
- * the barrier and all parameters before create; every worker has the same
- * query_count and executes the same unconditional waits.
- *
- * Owner publication  -> B0: original columns and mailbox pointers are readable.
- * Producer writes     -> B1: consumers may read exchange blocks.
- * Consumer reads      -> B2: owners may reuse those blocks in the next query.
- * The final B2 also precedes all original-column/mailbox/payload destruction.
- * I/O/OOM errors suppress computation but never skip a loop barrier.
- */
+int read_encoded_keys(group_input *input)
+{
+    for (const worker_input *peer = worker_inputs; peer; peer = peer->next) {
+        if (peer->keys.error) {
+            return error_peer;
+        }
+        input->keys[peer->worker_id] = peer->keys;
+    }
+    return error_none;
+}
+
+/* Barriers implement actual stage dependencies: publish immutable inputs,
+ * publish composite-key encoding when needed, complete grouping, then finish
+ * reductions before releasing shared row lists. Numeric keys have no producer
+ * phase. Errors suppress work, never the waits required by the query. */
 void *worker_entry(void *argument)
 {
     worker_input *input = argument;
-
-    /* Keep owner pointers directly rooted at this worker's malloc calls.
-     * Publication does not change ownership; the report escapes only at join. */
-    worker_mailbox *mailbox = malloc(
-        sizeof(*mailbox) + input->partition_count * sizeof(exchange_partition));
     worker_report *report =
         malloc(sizeof(*report) + input->query_count * sizeof(query_preview));
     query_result *results = malloc(input->query_count * sizeof(*results));
     int error = error_none;
-    if (!mailbox || !report || !results) {
+    if (!report || !results) {
         error = error_memory;
     }
     if (report) {
@@ -958,73 +977,73 @@ void *worker_entry(void *argument)
             results[query] = (query_result){0};
         }
     }
-    if (mailbox) {
-        *mailbox = (worker_mailbox){0};
-        for (size_t partition = 0; partition < input->partition_count;
-             ++partition) {
-            mailbox->partitions[partition] = (exchange_partition){0};
-        }
-    }
-    input->mailbox = mailbox;
-    group_indices groups = {0};
     group_input received = {
-        .shards = malloc(input->thread_count * sizeof(resident_frame))};
-    if (!received.shards) {
+        .shards = malloc(input->thread_count * sizeof(resident_frame)),
+        .keys = malloc(input->thread_count * sizeof(encoded_keys)),
+        .shard_count = input->thread_count};
+    if (!received.shards || !received.keys) {
         error = error_memory;
     }
     if (!error) {
         error = load_input_shard(input, &input->frame);
     }
+    input->error = error;
 
-    pthread_barrier_wait(&worker_barrier); /* B0: publication and input done. */
+    pthread_barrier_wait(&worker_barrier); /* Original columns are published. */
     double query_begin_ms = elapsed_ms(0.0);
-    if (received.shards) {
-        for (const worker_input *peer = worker_inputs; peer;
-             peer = peer->next) {
-            received.shards[peer->worker_id] = peer->frame;
-        }
+    if (!error) {
+        error = read_input_shards(&received);
     }
-
     for (size_t query_index = 0; query_index < input->query_count;
          ++query_index) {
         size_t op = input->schedule[query_index % input->schedule_count];
         const query_spec *query = &input->queries[op];
-        query_layout layout = prepare_query_layout(query);
         received.query = query;
-        received.layout = &layout;
-        if (mailbox) {
-            for (size_t partition = 0; partition < input->partition_count;
-                 ++partition) {
-                mailbox->partitions[partition].rows = 0;
-            }
+        if (query->key_count > 1) {
+            input->keys = (encoded_keys){.error = error};
             if (!error) {
-                error = produce_partitions(&input->frame, query, &layout,
-                                           mailbox, input->partition_count,
-                                           input->worker_id);
+                input->keys.error = encode_group_keys(&input->frame, query,
+                                                      &input->keys);
+                error = input->keys.error;
             }
-            mailbox->error = error;
+            pthread_barrier_wait(&worker_barrier); /* Encoded keys are ready. */
+            if (!error) {
+                error = read_encoded_keys(&received);
+            }
         }
-
-        pthread_barrier_wait(&worker_barrier); /* B1: exchange is read-only. */
-
+        size_t partition_count = input->partition_count;
+        if (input->thread_count == 1 ||
+            (query->key_count == 1 &&
+             received.rows <= numeric_thread_min_rows)) {
+            partition_count = 1;
+        }
         if (!error) {
-            error = consume_partitions(input, &received, &groups,
-                                       &results[query_index],
-                                       &report->queries[query_index]);
+            error = build_partition_groups(input, &received, partition_count);
         }
-
-        pthread_barrier_wait(
-            &worker_barrier); /* B2: all packet readers done. */
+        input->query_error = error;
+        pthread_barrier_wait(&worker_barrier); /* Every group is complete. */
+        if (query->key_count > 1) {
+            free(input->keys.bytes);
+            free(input->keys.hashes);
+        }
+        if (!error) {
+            group_indices groups = {0};
+            error = collect_group_slice(input, &groups);
+            if (!error) {
+                error = materialize_groups(&received, &groups,
+                                           &results[query_index],
+                                           &report->queries[query_index]);
+            }
+            free(groups.groups);
+        }
+        pthread_barrier_wait(&worker_barrier); /* All group readers are done. */
+        free_partition_groups(input);
     }
-    /* Keep final workspace and exchange cleanup inside the same continuous
-     * query interval. The final B2 has ended every shared-input/packet read. */
-    free_group_indices(&groups);
+    free(received.keys);
     free(received.shards);
-    free_exchange(mailbox, input->partition_count);
     double query_end_ms = elapsed_ms(0.0);
 
-    /* Inputs and complete outputs live through query timing, as in the Rust
-     * comparison driver. Their final release is included in application_ms. */
+    /* Keeping completed results is the benchmark driver's lifetime policy. */
     free(input->frame.keys);
     free(input->frame.valid);
     free_query_results(results, input->query_count);
@@ -1185,8 +1204,7 @@ int prepare_query_schedule(const benchmark_config *config,
         }
     }
     if (config->passes > SIZE_MAX / schedule->count ||
-        config->partition_count >
-            (SIZE_MAX - sizeof(worker_mailbox)) / sizeof(exchange_partition)) {
+        config->partition_count > SIZE_MAX / sizeof(group_indices)) {
         printf("Requested query or partition count is too large.\n");
         return -1;
     }
